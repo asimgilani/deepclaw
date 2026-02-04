@@ -4,6 +4,9 @@
 venv/
 env/
 
+# ngrok config (contains auth token)
+ngrok.yml
+
 # Python
 __pycache__/
 *.py[cod]
