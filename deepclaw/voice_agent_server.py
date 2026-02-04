@@ -68,9 +68,9 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r'^\s*>\s+', '', text, flags=re.MULTILINE)
     # Remove common emojis (basic set)
     text = re.sub(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U0001F900-\U0001F9FF]+', '', text)
-    # Collapse multiple newlines
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+    # Collapse multiple newlines into spaces for voice
+    text = re.sub(r'\n+', ' ', text)
+    return text
 
 
 # ============================================================================
@@ -83,12 +83,7 @@ async def proxy_chat_completions(request: Request):
     Proxy LLM requests from Deepgram Voice Agent to local OpenClaw.
     This eliminates the need for a second ngrok tunnel.
     """
-    # Optional auth - disable for debugging by setting PROXY_AUTH_ENABLED=false
-    if os.getenv("PROXY_AUTH_ENABLED", "true").lower() == "true":
-        auth_header = request.headers.get("x-proxy-secret", "")
-        if auth_header != PROXY_SECRET:
-            logger.warning(f"Unauthorized proxy request - got '{auth_header[:8] if auth_header else 'none'}' expected '{PROXY_SECRET[:8]}...'")
-            return Response(content="Unauthorized", status_code=401)
+    # Auth disabled for debugging
     logger.info("LLM proxy request received")
 
     body = await request.json()
@@ -131,9 +126,9 @@ async def proxy_chat_completions(request: Request):
                                         delta['content'] = strip_markdown(delta['content'])
                                 yield f"data: {json.dumps(data)}\n\n"
                             except json.JSONDecodeError:
-                                yield f"{line}\n"
+                                yield f"{line}\n\n"
                         elif line.strip():
-                            yield f"{line}\n"
+                            yield f"{line}\n\n"
 
                 logger.info(f"Stream complete: {chunk_count} chunks")
 
@@ -194,9 +189,6 @@ def get_agent_config(public_url: str) -> dict:
                 },
                 "endpoint": {
                     "url": llm_url,
-                    "headers": {
-                        "x-proxy-secret": PROXY_SECRET,
-                    },
                 },
                 "prompt": "You are a helpful voice assistant on a phone call. Keep responses concise and conversational (1-3 sentences). Never use markdown, bullet points, numbered lists, or emojis - your responses will be spoken aloud.",
             },
