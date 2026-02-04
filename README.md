@@ -63,7 +63,7 @@ OpenClaw will walk you through:
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/yourusername/deepclaw.git
+git clone https://github.com/deepgram/deepclaw.git
 cd deepclaw
 pip install -e .
 ```
