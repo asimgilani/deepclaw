@@ -83,11 +83,13 @@ async def proxy_chat_completions(request: Request):
     Proxy LLM requests from Deepgram Voice Agent to local OpenClaw.
     This eliminates the need for a second ngrok tunnel.
     """
-    # Verify the request comes from our Deepgram agent (has our secret)
-    auth_header = request.headers.get("x-proxy-secret", "")
-    if auth_header != PROXY_SECRET:
-        logger.warning("Unauthorized proxy request - invalid or missing x-proxy-secret")
-        return Response(content="Unauthorized", status_code=401)
+    # Optional auth - disable for debugging by setting PROXY_AUTH_ENABLED=false
+    if os.getenv("PROXY_AUTH_ENABLED", "true").lower() == "true":
+        auth_header = request.headers.get("x-proxy-secret", "")
+        if auth_header != PROXY_SECRET:
+            logger.warning(f"Unauthorized proxy request - got '{auth_header[:8] if auth_header else 'none'}' expected '{PROXY_SECRET[:8]}...'")
+            return Response(content="Unauthorized", status_code=401)
+    logger.info("LLM proxy request received")
 
     body = await request.json()
 

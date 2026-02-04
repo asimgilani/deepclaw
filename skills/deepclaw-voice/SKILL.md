@@ -118,10 +118,13 @@ def strip_markdown(text: str) -> str:
 
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
-    auth_header = request.headers.get("x-proxy-secret", "")
-    if auth_header != PROXY_SECRET:
-        logger.warning("Unauthorized proxy request")
-        return Response(content="Unauthorized", status_code=401)
+    # Optional auth - disable for debugging by setting PROXY_AUTH_ENABLED=false
+    if os.getenv("PROXY_AUTH_ENABLED", "true").lower() == "true":
+        auth_header = request.headers.get("x-proxy-secret", "")
+        if auth_header != PROXY_SECRET:
+            logger.warning(f"Unauthorized proxy request - got '{auth_header[:8]}...' expected '{PROXY_SECRET[:8]}...'")
+            return Response(content="Unauthorized", status_code=401)
+    logger.info("LLM proxy request received")
 
     body = await request.json()
     body["model"] = "claude-haiku-4-5"
@@ -328,7 +331,10 @@ python-dotenv>=1.0.0
 DEEPGRAM_API_KEY=<their_deepgram_key>
 OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
 OPENCLAW_GATEWAY_TOKEN=<generate_one>
+PROXY_AUTH_ENABLED=false
 ```
+
+Note: `PROXY_AUTH_ENABLED=false` disables the proxy authentication check. Set to `true` once you've verified calls work.
 
 Generate a token for them:
 ```bash
