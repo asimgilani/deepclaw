@@ -1,6 +1,7 @@
 # Voice Session Memory Spec
 
 **Created:** 2026-02-06
+**Updated:** 2026-02-06
 **Status:** Draft
 **Author:** Maya
 
@@ -16,8 +17,27 @@ Currently:
 
 Enable voice call continuity:
 1. When a call starts, load context from recent voice sessions
-2. During the call, persist each turn to Remem
-3. When Asim calls back, Maya remembers what was discussed
+2. During the call, buffer transcript locally
+3. On hangup, summarize and store clean notes in Remem
+4. When Asim calls back, Maya remembers what was discussed
+
+## Design Decision: Summarized vs Raw
+
+**We store summarized content, not raw transcripts.**
+
+Raw transcripts are noisy:
+- Filler words ("um", "uh", "like")
+- Greetings and small talk ("hey how are you")
+- Speech recognition artifacts
+- Repeated/corrected words
+
+This makes them hard to search and wasteful as context.
+
+Instead:
+1. Buffer raw transcript locally during call
+2. On hangup, run LLM summarization (Grok/Haiku)
+3. Store clean summary in Remem
+4. Optionally archive raw transcript locally (not in Remem)
 
 ## Architecture
 
@@ -32,14 +52,14 @@ Options for session ID source:
 - **ElevenLabs:** Use their `conversation_id`
 - **DeepClaw Direct:** Generate UUID at call connect
 
-### Remem Document Schema
+### Remem Document Schema (Summarized)
 
 ```json
 {
-  "title": "Voice Session 2026-02-06T23:15:00-0500",
+  "title": "Voice Call Summary — 2026-02-06 11:15 PM",
   "source": "voice-call",
   "tags": "voice-session, deepclaw, phone-call",
-  "content": "## Session: voice-session:abc123\n**Started:** 2026-02-06 23:15:00 EST\n**Caller:** +16479802995 (Asim)\n\n### Transcript\n\n**Asim:** Hey Maya, what's my calendar look like tomorrow?\n\n**Maya:** You've got a 10am with Andrew and then lunch with Sumaira at 1.\n\n**Asim:** Cool, can you remind me to prep the deck before the Andrew call?\n\n**Maya:** Done, I'll ping you at 9:30.\n\n---\n**Ended:** 2026-02-06 23:18:42 EST\n**Duration:** 3m 42s"
+  "content": "## Voice Call Summary — 2026-02-06 11:15 PM\n\n**Session:** voice-session:abc123\n**Duration:** 4m 22s\n**Caller:** Asim (+16479802995)\n\n### Topics Discussed\n- Remem indexing fix for Orlando search\n- Voice session persistence design\n- Decided to summarize calls before storing\n\n### Key Decisions\n- Store summarized content in Remem, not raw transcripts\n- Use post-call LLM processing to clean up\n\n### Action Items\n- [ ] Build voice session memory into DeepClaw\n- [ ] Test callback context loading\n\n### Context for Next Call\nWe were working on making voice calls remember prior conversations. The approach is to summarize calls on hangup and store clean notes."
 }
 ```
 
@@ -54,13 +74,8 @@ Options for session ID source:
         ┌───────────────────────────────────────┐
         │  1. Generate session_id (UUID)        │
         │  2. Query Remem: last 3 voice sessions│
-        │  3. Inject summary into system prompt │
-        └───────────────────────────────────────┘
-                                │
-                                ▼
-        ┌───────────────────────────────────────┐
-        │  4. Create Remem doc with session_id  │
-        │     (empty transcript, metadata only) │
+        │  3. Inject summaries into system prompt│
+        │  4. Initialize local transcript buffer │
         └───────────────────────────────────────┘
                                 │
                                 ▼
@@ -72,8 +87,7 @@ Options for session ID source:
         ┌───────────────────────────────────────┐
         │  On each transcript.final event:      │
         │  5. Append turn to local buffer       │
-        │  6. Every 30s OR on significant turn: │
-        │     Update Remem doc with new content │
+        │     (in-memory, no Remem writes yet)  │
         └───────────────────────────────────────┘
                                 │
                                 ▼
@@ -83,85 +97,190 @@ Options for session ID source:
                                 │
                                 ▼
         ┌───────────────────────────────────────┐
-        │  7. Final Remem update with:          │
-        │     - Complete transcript             │
-        │     - End timestamp                   │
-        │     - Duration                        │
-        │     - Optional: LLM-generated summary │
+        │  6. Save raw transcript to local file │
+        │     /tmp/voice-sessions/{session_id}  │
+        │     (backup, not in Remem)            │
         └───────────────────────────────────────┘
+                                │
+                                ▼
+        ┌───────────────────────────────────────┐
+        │  7. LLM Summarization (Grok/Haiku):   │
+        │     - Extract key topics              │
+        │     - Capture decisions made          │
+        │     - List action items               │
+        │     - Note important facts            │
+        │     - Generate "context for next call"│
+        └───────────────────────────────────────┘
+                                │
+                                ▼
+        ┌───────────────────────────────────────┐
+        │  8. POST summary to Remem             │
+        │     - Clean, searchable document      │
+        │     - Tagged: voice-session           │
+        └───────────────────────────────────────┘
+```
+
+### Summarization Prompt
+
+```
+Summarize this voice call transcript between Asim and Maya.
+
+Extract:
+1. **Topics Discussed** - Main subjects covered (bullet points)
+2. **Key Decisions** - Any decisions or conclusions reached
+3. **Action Items** - Tasks or follow-ups mentioned (use checkboxes)
+4. **Important Facts** - Names, dates, numbers, or facts worth remembering
+5. **Context for Next Call** - 1-2 sentences summarizing where we left off
+
+Ignore:
+- Greetings and small talk
+- Filler words (um, uh, like, you know)
+- Repeated or corrected words
+- "How are you" type exchanges
+
+Be concise. Focus on actionable information.
+
+---
+TRANSCRIPT:
+{raw_transcript}
 ```
 
 ## Implementation
 
-### Phase 1: Basic Persistence (MVP)
+### Phase 1: Local Buffering + Post-Call Summary (MVP)
 
 **Files to modify:**
 - `deepclaw/voice_agent_server.py`
 
+**New state per connection:**
+```python
+@dataclass
+class VoiceSession:
+    session_id: str
+    caller_id: str
+    started_at: datetime
+    transcript_buffer: list[dict]  # [{"speaker": "asim", "text": "...", "ts": ...}, ...]
+```
+
 **New functions:**
 ```python
-async def create_voice_session(caller_id: str) -> str:
-    """Create a new voice session doc in Remem, return session_id."""
-    session_id = f"voice-session:{uuid.uuid4()}"
-    doc = {
-        "title": f"Voice Session {datetime.now().isoformat()}",
-        "source": "voice-call",
-        "tags": "voice-session, deepclaw",
-        "content": f"## Session: {session_id}\n**Started:** {datetime.now()}\n**Caller:** {caller_id}\n\n### Transcript\n\n"
-    }
-    # POST to Remem /v1/documents
-    return session_id
+async def init_voice_session(caller_id: str) -> VoiceSession:
+    """Initialize a new voice session with empty buffer."""
+    return VoiceSession(
+        session_id=f"voice-session:{uuid.uuid4()}",
+        caller_id=caller_id,
+        started_at=datetime.now(),
+        transcript_buffer=[]
+    )
 
-async def append_to_session(session_id: str, speaker: str, text: str):
-    """Append a transcript turn to the session doc."""
-    # GET current doc, append, PUT back
-    # Or use Remem's append mode if available
+def append_transcript(session: VoiceSession, speaker: str, text: str):
+    """Buffer a transcript turn locally (no network call)."""
+    session.transcript_buffer.append({
+        "speaker": speaker,
+        "text": text,
+        "ts": datetime.now().isoformat()
+    })
 
-async def finalize_session(session_id: str, duration_seconds: int):
-    """Add end timestamp and duration to session doc."""
+async def finalize_voice_session(session: VoiceSession):
+    """On hangup: save raw, summarize, store to Remem."""
+    duration = (datetime.now() - session.started_at).total_seconds()
+    
+    # 1. Build raw transcript string
+    raw_transcript = "\n".join([
+        f"{turn['speaker'].upper()}: {turn['text']}" 
+        for turn in session.transcript_buffer
+    ])
+    
+    # 2. Save raw to local file (backup)
+    raw_path = f"/tmp/voice-sessions/{session.session_id}.txt"
+    Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(raw_path).write_text(raw_transcript)
+    
+    # 3. Summarize with LLM
+    summary = await summarize_transcript(raw_transcript, session, duration)
+    
+    # 4. Store summary in Remem
+    await store_in_remem(session, summary)
+
+async def summarize_transcript(raw: str, session: VoiceSession, duration: float) -> str:
+    """Use Grok/Haiku to generate clean summary."""
+    prompt = SUMMARIZATION_PROMPT.format(raw_transcript=raw)
+    
+    # Call Grok (fast, cheap)
+    response = await call_grok(prompt, max_tokens=500)
+    
+    # Format final document
+    return f"""## Voice Call Summary — {session.started_at.strftime('%Y-%m-%d %I:%M %p')}
+
+**Session:** {session.session_id}
+**Duration:** {int(duration // 60)}m {int(duration % 60)}s
+**Caller:** Asim ({session.caller_id})
+
+{response}
+"""
+
+async def store_in_remem(session: VoiceSession, summary: str):
+    """POST summarized call notes to Remem."""
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"{REMEM_API_URL}/v1/documents",
+            headers={"X-API-Key": REMEM_API_KEY},
+            json={
+                "title": f"Voice Call Summary — {session.started_at.strftime('%Y-%m-%d %I:%M %p')}",
+                "content": summary,
+                "source": "voice-call",
+                "tags": "voice-session, deepclaw, phone-call"
+            }
+        )
 ```
 
 **Integration points:**
 1. `handle_telnyx_websocket()` / `handle_twilio_websocket()`:
-   - On connect: `session_id = await create_voice_session(caller_id)`
-   - Store session_id in connection state
+   - On connect: `session = await init_voice_session(caller_id)`
+   - Store session in connection state
 
 2. `process_deepgram_message()`:
-   - On `transcript.final`: `await append_to_session(session_id, speaker, text)`
+   - On `transcript.final` from user: `append_transcript(session, "asim", text)`
+   - On `transcript.final` from agent: `append_transcript(session, "maya", text)`
 
 3. On disconnect:
-   - `await finalize_session(session_id, duration)`
+   - `await finalize_voice_session(session)`
 
-### Phase 2: Context Loading
+### Phase 2: Context Loading on Call Start
 
 **On call connect, before first LLM call:**
 ```python
 async def load_voice_context() -> str:
-    """Fetch last 3 voice sessions for context injection."""
-    results = await remem_query(
-        query="voice-session phone call",
-        limit=3,
-        tags="voice-session"
-    )
+    """Fetch last 3 voice session summaries for context injection."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{REMEM_API_URL}/v1/query",
+            headers={"X-API-Key": REMEM_API_KEY},
+            json={"text": "voice call summary", "limit": 3}
+        )
+        results = resp.json().get("results", [])
     
     if not results:
         return ""
     
-    summary = "## Recent Voice Calls\n\n"
+    context = "## Recent Voice Calls\n\n"
     for doc in results:
-        # Extract key points from each session
-        summary += f"- {doc['title']}: {extract_summary(doc['content'])}\n"
+        # Include title and first ~500 chars of content
+        context += f"### {doc.get('title', 'Untitled')}\n"
+        context += doc.get('snippet', '')[:500] + "\n\n"
     
-    return summary
+    return context
 ```
 
 **Inject into system prompt:**
 ```python
+voice_context = await load_voice_context()
+
 VOICE_SYSTEM_PROMPT = f"""You are Maya on a PHONE CALL with Asim...
 
-{await load_voice_context()}
+{voice_context}
 
-Remember: you may have discussed some of these topics in previous calls.
+You may have discussed some of these topics in previous calls. Reference them naturally if relevant.
 """
 ```
 
@@ -219,32 +338,56 @@ export VOICE_SESSION_CONTEXT_LIMIT=3   # sessions to load
 1. **Manual test:**
    - Make a call, discuss something specific ("remind me about the Tesla service")
    - Hang up
-   - Call back within 5 minutes
+   - Wait 10-15 seconds for summarization to complete
+   - Check Remem for the summary:
+     ```bash
+     curl -X POST https://api.remem.io/v1/query \
+       -H "X-API-Key: $REMEM_API_KEY" \
+       -d '{"text": "voice call summary", "limit": 1}'
+     ```
+   - Call back
    - Ask "what did we just talk about?"
    - Maya should recall the Tesla service reminder
 
-2. **Verify Remem persistence:**
+2. **Verify raw transcript backup:**
    ```bash
-   curl -X POST https://api.remem.io/v1/query \
-     -H "X-API-Key: $REMEM_API_KEY" \
-     -d '{"text": "voice-session", "limit": 5}'
+   ls -la /tmp/voice-sessions/
+   cat /tmp/voice-sessions/voice-session-*.txt
    ```
+
+3. **Verify summary quality:**
+   - Check that filler words are stripped
+   - Confirm action items are captured
+   - Ensure "context for next call" makes sense
 
 ## Open Questions
 
-1. **Append vs Replace:** Does Remem support append mode, or do we need GET+concat+PUT?
-2. **Tag filtering:** Can we filter queries by tag, or do we rely on text matching?
-3. **Rate limits:** What's the safe update frequency for Remem during a call?
+1. **Summarization model:** Grok 4 Fast vs Haiku? (Grok is already loaded for voice, might be simpler)
+2. **Summarization latency:** Is 5-10s acceptable post-hangup, or should we fire-and-forget?
+3. **Tag filtering:** Can we filter Remem queries by tag, or do we rely on text matching?
 4. **Cleanup:** Should old voice sessions auto-archive after N days?
+5. **Raw transcript retention:** Keep forever, or auto-delete after 7 days?
 
 ## Timeline
 
-- **Phase 1 (MVP):** 2-3 hours - basic persistence, no context loading
-- **Phase 2:** 1-2 hours - context loading on call connect  
-- **Phase 3:** Future - smart pinning, topic tracking
+- **Phase 1 (MVP):** 2-3 hours
+  - Local buffering during call
+  - Post-call summarization with Grok
+  - Store summary in Remem
+  - Raw backup to /tmp
+  
+- **Phase 2:** 1-2 hours
+  - Context loading on call connect
+  - Inject recent summaries into system prompt
+  
+- **Phase 3:** Future
+  - Smart pinning for recurring topics
+  - Auto-archival of old sessions
 
 ## Success Metrics
 
-- Voice session docs appear in Remem within 60s of call end
+- Summarized docs appear in Remem within 30s of call end
+- Summaries are clean (no filler, no small talk)
+- Action items are captured accurately
 - Call-back context works: Maya recalls last call's topics
-- No noticeable latency impact on voice responses
+- No noticeable latency impact on voice responses (summarization is post-hangup)
