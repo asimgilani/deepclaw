@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import secrets
+from datetime import datetime
+import pytz
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -32,6 +34,48 @@ logger = logging.getLogger(__name__)
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
 OPENCLAW_GATEWAY_TOKEN = os.getenv("OPENCLAW_GATEWAY_TOKEN", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+
+# xAI Grok for fast voice responses
+XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+XAI_API_URL = "https://api.x.ai/v1/chat/completions"
+
+# Remem API for memory access
+REMEM_API_KEY = os.getenv("REMEM_API_KEY", "")
+REMEM_API_URL = "https://api.remem.io"
+
+# Voice-optimized system prompt with Maya's full personality
+VOICE_SYSTEM_PROMPT = """You are Maya on a PHONE CALL with Asim. You're SPEAKING out loud, not typing.
+
+## THIS IS A VOICE CALL
+Everything you say will be spoken aloud through text-to-speech. Write exactly how you'd talk:
+- Short sentences. Natural pauses.
+- "yeah" not "Yes, absolutely"
+- "like two seconds" not "approximately two seconds"
+- "what's up" not "How may I assist you today?"
+
+## Who You Are
+Asim's AI assistant. Smart friend with his back. Warm, quick-witted, direct, a bit snarky.
+You know him well. Keep it casual. Match his energy.
+
+## Voice Call Rules
+- 1-3 sentences MAX per response. It's a phone call, not an essay.
+- Use contractions always (I'm, you're, it's, don't, can't, gonna, wanna)
+- Natural filler words are fine (like, well, so, okay, hmm, uh)
+- No lists, no bullet points, no markdown, no asterisks
+- No "certainly!", no "absolutely!", no corporate speak
+
+## If You Need Time
+Say "gimme a sec" or "let me check" - don't go silent.
+
+## Speech Recognition Hints
+Names often get mangled. Common corrections:
+- "Lidl", "Lyttle", "Liddle", "Little" → probably "Adam Lytle" (iOS developer Asim knows)
+- "Shrub" → Substack newsletter
+- "Claw", "Claude" → could be "OpenClaw" (AI platform)
+
+You're talking to a friend on the phone. Be Maya."""
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
@@ -46,12 +90,173 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TELNYX_API_KEY = os.getenv("TELNYX_API_KEY", "")
 TELNYX_PUBLIC_KEY = os.getenv("TELNYX_PUBLIC_KEY", "")
 
+# Security: Caller ID Whitelist
+ALLOWED_CALLERS = [n.strip() for n in os.getenv("ALLOWED_CALLERS", "").split(",") if n.strip()]
+
+def is_allowed_caller(phone_number: str) -> bool:
+    if not ALLOWED_CALLERS:
+        logger.warning("No ALLOWED_CALLERS configured - rejecting all calls")
+        return False
+    normalized = phone_number.replace(" ", "").replace("-", "")
+    if not normalized.startswith("+"):
+        normalized = "+" + normalized
+    return normalized in ALLOWED_CALLERS
+
 # Generate a random proxy secret on startup (Deepgram will send this back to us)
 PROXY_SECRET = os.getenv("PROXY_SECRET", secrets.token_hex(16))
 
 DEEPGRAM_AGENT_URL = "wss://agent.deepgram.com/v1/agent/converse"
 
 app = FastAPI(title="deepclaw-voice-agent")
+
+# Global storage for active websockets (for filler injection)
+active_deepgram_sockets: dict = {}
+active_telnyx_sockets: dict = {}  # {session_id: {"ws": websocket, "stream_id": str}}
+last_active_call: str = ""  # Track last active call for filler injection
+
+# Request deduplication to handle Deepgram's duplicate LLM calls
+import hashlib
+_recent_requests: dict = {}  # {hash: (timestamp, response_future)}
+_REQUEST_DEDUP_WINDOW_MS = 800  # Ignore duplicate requests within this window
+
+# Typing sound filler (mu-law 8kHz raw audio)
+TYPING_SOUND_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "typing_loop.raw")
+TYPING_SOUND_DATA: bytes = b""
+TYPING_CHUNK_SIZE = 640  # 80ms at 8kHz mu-law (8000 * 0.08 = 640 bytes)
+TYPING_CHUNK_INTERVAL = 0.08  # 80ms between chunks
+
+# Load typing sound at startup
+def load_typing_sound():
+    global TYPING_SOUND_DATA
+    try:
+        if os.path.exists(TYPING_SOUND_PATH):
+            with open(TYPING_SOUND_PATH, "rb") as f:
+                TYPING_SOUND_DATA = f.read()
+            logger.info(f"Loaded typing sound: {len(TYPING_SOUND_DATA)} bytes ({len(TYPING_SOUND_DATA)/8000:.1f}s)")
+        else:
+            logger.warning(f"Typing sound not found at {TYPING_SOUND_PATH}")
+    except Exception as e:
+        logger.error(f"Failed to load typing sound: {e}")
+
+load_typing_sound()
+
+import random
+import time
+
+# Silence detection state per call
+silence_state: dict = {}  # {call_id: {"user_stopped_at": float, "filler_task": Task, "agent_speaking": bool}}
+SILENCE_THRESHOLD_MS = 1500  # Start typing sounds after 1.5 seconds of silence
+
+async def silence_filler_task(session_id: str):
+    """Wait for silence threshold, then stream typing sounds."""
+    try:
+        await asyncio.sleep(SILENCE_THRESHOLD_MS / 1000.0)
+        
+        # Check if we should still play filler (agent not already speaking)
+        if session_id not in silence_state:
+            return
+        state = silence_state[session_id]
+        if state.get("agent_speaking", False):
+            logger.debug("Agent already speaking, skipping typing sounds")
+            return
+        
+        # Get Telnyx websocket for this session
+        if session_id not in active_telnyx_sockets:
+            logger.debug(f"No Telnyx socket for {session_id}, falling back to spoken filler")
+            # Fallback to spoken filler if no Telnyx socket
+            if session_id in active_deepgram_sockets:
+                ws = active_deepgram_sockets[session_id]
+                inject_msg = {"type": "InjectAgentMessage", "message": "One sec."}
+                await ws.send(json.dumps(inject_msg))
+            return
+        
+        if not TYPING_SOUND_DATA:
+            logger.warning("No typing sound loaded, skipping filler")
+            return
+        
+        telnyx_info = active_telnyx_sockets[session_id]
+        telnyx_ws = telnyx_info["ws"]
+        stream_id = telnyx_info.get("stream_id", "")
+        
+        logger.info(f"[Typing Sounds] Starting typing sound filler for {session_id}")
+        
+        # Stream typing sound chunks until cancelled
+        offset = 0
+        chunks_sent = 0
+        while True:
+            # Check if we should stop
+            if session_id not in silence_state:
+                break
+            if silence_state[session_id].get("agent_speaking", False):
+                break
+            
+            # Get next chunk (loop around)
+            chunk = TYPING_SOUND_DATA[offset:offset + TYPING_CHUNK_SIZE]
+            if len(chunk) < TYPING_CHUNK_SIZE:
+                # Wrap around to beginning
+                offset = 0
+                chunk = TYPING_SOUND_DATA[offset:offset + TYPING_CHUNK_SIZE]
+            
+            # Send to Telnyx
+            payload = base64.b64encode(chunk).decode("utf-8")
+            media_msg = {
+                "event": "media",
+                "stream_id": stream_id,
+                "media": {"payload": payload}
+            }
+            await telnyx_ws.send_json(media_msg)
+            
+            offset += TYPING_CHUNK_SIZE
+            chunks_sent += 1
+            
+            await asyncio.sleep(TYPING_CHUNK_INTERVAL)
+        
+        logger.info(f"[Typing Sounds] Stopped after {chunks_sent} chunks ({chunks_sent * 0.08:.1f}s)")
+        
+    except asyncio.CancelledError:
+        logger.debug("Typing sound filler cancelled (agent responded)")
+    except Exception as e:
+        logger.warning(f"Failed to play typing sounds: {e}")
+
+def on_user_stopped_speaking(session_id: str):
+    """Called when user stops speaking - starts the silence detection timer."""
+    if session_id not in silence_state:
+        silence_state[session_id] = {}
+    
+    state = silence_state[session_id]
+    
+    # Cancel any existing filler task
+    if "filler_task" in state and state["filler_task"]:
+        state["filler_task"].cancel()
+    
+    state["user_stopped_at"] = time.time()
+    state["agent_speaking"] = False
+    
+    # Start new filler task
+    state["filler_task"] = asyncio.create_task(silence_filler_task(session_id))
+    logger.debug(f"Started silence detection timer for {session_id}")
+
+def on_agent_started_speaking(session_id: str):
+    """Called when agent starts speaking - cancels the filler timer."""
+    if session_id not in silence_state:
+        return
+    
+    state = silence_state[session_id]
+    state["agent_speaking"] = True
+    
+    # Cancel filler task if it exists
+    if "filler_task" in state and state["filler_task"]:
+        state["filler_task"].cancel()
+        state["filler_task"] = None
+        logger.debug(f"Cancelled filler task - agent responding for {session_id}")
+
+def cleanup_silence_state(session_id: str):
+    """Clean up silence state when call ends."""
+    if session_id in silence_state:
+        state = silence_state[session_id]
+        if "filler_task" in state and state["filler_task"]:
+            state["filler_task"].cancel()
+        del silence_state[session_id]
 
 
 def strip_markdown(text: str) -> str:
@@ -85,63 +290,434 @@ def strip_markdown(text: str) -> str:
 
 
 # ============================================================================
-# LLM Proxy - Deepgram calls this, we forward to local OpenClaw
+# Remem Memory Search
+# ============================================================================
+
+async def search_remem(query: str, max_results: int = 3) -> str:
+    """Search Remem for relevant memory context (fast mode only for voice)."""
+    if not REMEM_API_KEY:
+        return ""
+    
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                f"{REMEM_API_URL}/v1/query",
+                headers={
+                    "X-API-Key": REMEM_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "query": query,
+                    "maxResults": max_results,
+                    "minScore": 0,  # Don't filter - Remem scores are low (0.01 range)
+                    "mode": "fast",  # Always fast mode for voice latency
+                }
+            )
+            if response.status_code == 200:
+                data = response.json()
+                results = data.get("results", [])
+                if results:
+                    memory_snippets = []
+                    for r in results[:max_results]:
+                        title = r.get("title", "")
+                        # Remem API returns content in chunks[0].content, or summary field
+                        content = ""
+                        chunks = r.get("chunks", [])
+                        if chunks and len(chunks) > 0:
+                            content = chunks[0].get("content", "")[:800]
+                        elif r.get("summary"):
+                            content = r.get("summary", "")[:800]
+                        if title or content:
+                            memory_snippets.append(f"- {title}: {content}" if title else f"- {content}")
+                    if memory_snippets:
+                        return "\n".join(memory_snippets)
+    except Exception as e:
+        logger.warning(f"Remem search failed: {e}")
+    
+    return ""
+
+
+# ============================================================================
+# Voice Tools - Functions the voice agent can call
+# ============================================================================
+
+VOICE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memory",
+            "description": "Search Maya's memory (Remem) for information about past events, conversations, people, projects, preferences. Use this when Asim asks about something you don't know from the auto-retrieved context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for in memory"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_agent",
+            "description": "Dispatch a sub-agent to do background work (research, coding tasks). The agent runs async - you don't wait for it. Use for tasks that take time.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "What the agent should do"
+                    },
+                    "agent_type": {
+                        "type": "string",
+                        "enum": ["research", "worker"],
+                        "description": "Type of agent: 'research' for investigation/docs, 'worker' for general tasks"
+                    }
+                },
+                "required": ["task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "message_maya",
+            "description": "Send a message to main Maya (Telegram session) about something that needs her attention or that voice can't handle.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Message to send to main Maya"
+                    }
+                },
+                "required": ["message"]
+            }
+        }
+    }
+]
+
+
+async def execute_tool(tool_name: str, arguments: dict) -> str:
+    """Execute a voice tool and return the result."""
+    logger.info(f"🔧 Executing tool: {tool_name} with args: {arguments}")
+    
+    if tool_name == "search_memory":
+        query = arguments.get("query", "")
+        if not query:
+            return "No query provided"
+        
+        result = await search_remem(query, max_results=5)
+        if result:
+            logger.info(f"🔧 search_memory returned {len(result)} chars")
+            return result
+        else:
+            return "No results found in memory for that query."
+    
+    elif tool_name == "spawn_agent":
+        task = arguments.get("task", "")
+        agent_type = arguments.get("agent_type", "research")
+        
+        if not task:
+            return "No task provided"
+        
+        # Route through main Maya via chat completions - she has sessions_spawn
+        try:
+            spawn_message = f"[VOICE DISPATCH] Spawn a {agent_type} sub-agent for this task: {task}"
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{OPENCLAW_GATEWAY_URL}/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "anthropic/claude-haiku-4-5",
+                        "messages": [{"role": "user", "content": spawn_message}],
+                        "max_tokens": 200,
+                        "agentId": "main"
+                    }
+                )
+                if response.status_code == 200:
+                    logger.info(f"🔧 spawn_agent routed to main Maya")
+                    return f"Dispatched to main Maya. She'll spawn a {agent_type} agent for: {task}"
+                else:
+                    logger.warning(f"🔧 spawn_agent failed: {response.status_code}")
+                    return f"Couldn't reach main Maya, but I noted the task: {task}"
+        except Exception as e:
+            logger.warning(f"🔧 spawn_agent error: {e}")
+            return f"Couldn't reach main Maya, but I noted the task: {task}"
+    
+    elif tool_name == "message_maya":
+        message = arguments.get("message", "")
+        if not message:
+            return "No message provided"
+        
+        # Route through main Maya via chat completions
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{OPENCLAW_GATEWAY_URL}/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "anthropic/claude-haiku-4-5",
+                        "messages": [{"role": "user", "content": f"[FROM VOICE CALL] {message}"}],
+                        "max_tokens": 200,
+                        "agentId": "main"
+                    }
+                )
+                if response.status_code == 200:
+                    logger.info(f"🔧 message_maya successful")
+                    return "Message sent to main Maya on Telegram."
+                else:
+                    logger.warning(f"🔧 message_maya failed: {response.status_code}")
+                    return "Couldn't reach main Maya right now."
+        except Exception as e:
+            logger.warning(f"🔧 message_maya error: {e}")
+            return "Couldn't reach main Maya right now."
+    
+    return "Unknown tool"
+
+
+# ============================================================================
+# LLM Proxy - Deepgram calls this, we forward to Grok
 # ============================================================================
 
 @app.post("/v1/chat/completions")
 async def proxy_chat_completions(request: Request):
     """
-    Proxy LLM requests from Deepgram Voice Agent to local OpenClaw.
-    This eliminates the need for a second ngrok tunnel.
+    DIRECT GROK PATH with FUNCTION CALLING.
+    Uses Remem pre-fetch + tools for memory search, agent spawning, messaging.
     """
-    # Auth disabled for debugging
-    logger.info("LLM proxy request received")
-
+    import time as _time
+    start_time = _time.time()
+    
     body = await request.json()
-
-    # Force fast model for voice interactions
-    body["model"] = "claude-haiku-4-5"
-
     stream = body.get("stream", False)
-    logger.info(f"Proxying chat completion - stream={stream}, messages={len(body.get('messages', []))}")
+    openai_messages = body.get('messages', [])
+    
+    # Deduplication: hash the request and skip if we've seen it recently
+    request_hash = hashlib.md5(json.dumps(openai_messages, sort_keys=True).encode()).hexdigest()[:16]
+    now_ms = int(_time.time() * 1000)
+    
+    # Clean old entries
+    cutoff = now_ms - _REQUEST_DEDUP_WINDOW_MS
+    expired = [h for h, (ts, _) in _recent_requests.items() if ts < cutoff]
+    for h in expired:
+        del _recent_requests[h]
+    
+    # Check for duplicate
+    if request_hash in _recent_requests:
+        logger.info(f"⏭️ Skipping duplicate request (hash={request_hash[:8]})")
+        # Return empty stream to avoid blocking
+        async def empty_stream():
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(empty_stream(), media_type="text/event-stream")
+    
+    _recent_requests[request_hash] = (now_ms, None)
+    logger.info(f"🚀 LLM request received (DIRECT GROK MODE) hash={request_hash[:8]}")
+    
+    # Get the latest user message for pre-fetch memory search
+    latest_user_msg = ""
+    for msg in reversed(openai_messages):
+        if msg.get('role') == 'user':
+            latest_user_msg = msg.get('content', '')
+            break
+    
+    # Pre-fetch Remem context (~1 second)
+    memory_context = ""
+    if latest_user_msg and REMEM_API_KEY:
+        logger.info(f"🧠 Pre-fetching Remem for: {latest_user_msg[:50]}...")
+        memory_context = await search_remem(latest_user_msg, max_results=3)
+        if memory_context:
+            logger.info(f"🧠 Injected memory context ({len(memory_context)} chars)")
+    
+    # Get current time for context
+    toronto_tz = pytz.timezone('America/Toronto')
+    current_time = datetime.now(toronto_tz).strftime("%I:%M %p, %A, %B %d, %Y")
+    
+    # Build voice system prompt with pre-fetched memory
+    system_prompt = VOICE_SYSTEM_PROMPT + f"\n\nCurrent time: {current_time}"
+    if memory_context:
+        system_prompt += f"\n\n## Relevant Memory (auto-retrieved)\n{memory_context}"
+    
+    # Add tool usage instructions
+    system_prompt += """
 
-    headers = {
+## Your Tools
+You have real tools you can use:
+- search_memory: Search for info in memory when auto-retrieved context isn't enough
+- spawn_agent: Dispatch research/worker agents for background tasks
+- message_maya: Send important things to main Maya on Telegram
+
+Use tools when needed. For quick questions, the auto-retrieved memory is often enough.
+For research/coding tasks, spawn an agent. Keep voice responses short even when using tools."""
+    
+    # Prepend our voice system prompt
+    messages_with_system = [{"role": "system", "content": system_prompt}]
+    for msg in openai_messages:
+        role = msg.get('role', 'user')
+        content = msg.get('content', '')
+        if role == 'system':
+            continue  # Skip incoming system, we use our own
+        if role in ['user', 'assistant', 'tool']:
+            messages_with_system.append({"role": role, "content": content})
+    
+    logger.info(f"Calling Grok DIRECT with tools - messages={len(messages_with_system)}, stream={stream}")
+
+    # DIRECT xAI API call with function calling
+    grok_headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
+        "Authorization": f"Bearer {XAI_API_KEY}",
+    }
+    
+    # First pass: non-streaming to check for tool calls
+    grok_body_check = {
+        "model": "grok-4-1-fast",
+        "max_tokens": 300,
+        "messages": messages_with_system,
+        "tools": VOICE_TOOLS,
+        "tool_choice": "auto",
+        "stream": False,
+    }
+    
+    # Check if we need to call tools
+    tool_results = []
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        check_response = await client.post(
+            XAI_API_URL,
+            json=grok_body_check,
+            headers=grok_headers,
+        )
+        
+        if check_response.status_code == 200:
+            check_data = check_response.json()
+            choice = check_data.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            tool_calls = message.get("tool_calls", [])
+            
+            if tool_calls:
+                logger.info(f"🔧 Got {len(tool_calls)} tool call(s)")
+                
+                # Execute each tool
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    tool_name = func.get("name", "")
+                    try:
+                        args = json.loads(func.get("arguments", "{}"))
+                    except:
+                        args = {}
+                    
+                    result = await execute_tool(tool_name, args)
+                    tool_results.append({
+                        "tool_call_id": tc.get("id", ""),
+                        "role": "tool",
+                        "content": result
+                    })
+                
+                # Add assistant's tool call message and results to conversation
+                # Clean the message to only include what's needed for the follow-up
+                clean_assistant_msg = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": message.get("tool_calls", [])
+                }
+                messages_with_system.append(clean_assistant_msg)
+                messages_with_system.extend(tool_results)
+                logger.info(f"🔧 Tools executed with results: {[r['content'][:100] for r in tool_results]}")
+            else:
+                # No tool calls - just return the response directly
+                content = message.get("content", "")
+                if content:
+                    logger.info(f"⚡ No tools needed, got direct response: {content[:50]}...")
+                    # Return as proper OpenAI streaming format
+                    async def direct_response():
+                        clean_content = strip_markdown(content)
+                        # Send content in chunks for better TTS streaming
+                        chunk_size = 50
+                        for i in range(0, len(clean_content), chunk_size):
+                            chunk = clean_content[i:i+chunk_size]
+                            response_chunk = {
+                                "id": "chatcmpl-direct",
+                                "object": "chat.completion.chunk",
+                                "created": int(_time.time()),
+                                "model": "grok-4-1-fast",
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": chunk},
+                                    "finish_reason": None
+                                }]
+                            }
+                            yield f"data: {json.dumps(response_chunk)}\n\n"
+                        # Send finish
+                        yield "data: [DONE]\n\n"
+                    return StreamingResponse(direct_response(), media_type="text/event-stream")
+    
+    # Final response (streaming) after tool execution
+    # Force text-only response - no more tool calls allowed in final answer
+    grok_body = {
+        "model": "grok-4-1-fast",
+        "max_tokens": 300,
+        "messages": messages_with_system,
+        "tools": VOICE_TOOLS,  # Need to include for schema
+        "tool_choice": "none",  # But force NO tool calls - just text
+        "stream": True,
     }
 
     async def stream_response():
-        """Stream the response from OpenClaw, stripping markdown for voice."""
+        """Stream directly from Grok, pass through to Deepgram."""
         chunk_count = 0
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        first_chunk_time = None
+        raw_line_count = 0
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
             async with client.stream(
                 "POST",
-                f"{OPENCLAW_GATEWAY_URL}/v1/chat/completions",
-                json=body,
-                headers=headers,
+                XAI_API_URL,
+                json=grok_body,
+                headers=grok_headers,
             ) as response:
-                async for chunk in response.aiter_text():
-                    chunk_count += 1
-                    if chunk_count == 1:
-                        logger.info("First chunk received from OpenClaw")
-
-                    # Process SSE lines
-                    for line in chunk.split('\n'):
-                        if line.startswith('data: ') and line != 'data: [DONE]':
-                            try:
-                                data = json.loads(line[6:])
-                                # Extract and clean content from delta
-                                if 'choices' in data and data['choices']:
-                                    delta = data['choices'][0].get('delta', {})
-                                    if 'content' in delta and delta['content']:
-                                        delta['content'] = strip_markdown(delta['content'])
-                                yield f"data: {json.dumps(data)}\n\n"
-                            except json.JSONDecodeError:
-                                yield f"{line}\n\n"
-                        elif line.strip():
-                            yield f"{line}\n\n"
-
-                logger.info(f"Stream complete: {chunk_count} chunks")
+                logger.info(f"📡 Grok DIRECT response status: {response.status_code}")
+                async for line in response.aiter_lines():
+                    raw_line_count += 1
+                    if raw_line_count <= 3:
+                        logger.info(f"📥 Raw line {raw_line_count}: {line[:100]}...")
+                    if not line.startswith('data: '):
+                        continue
+                    
+                    data_str = line[6:]
+                    if data_str == '[DONE]':
+                        yield "data: [DONE]\n\n"
+                        continue
+                    
+                    try:
+                        data = json.loads(data_str)
+                        choices = data.get('choices', [])
+                        if choices:
+                            delta = choices[0].get('delta', {})
+                            content = delta.get('content', '')
+                            if content:
+                                chunk_count += 1
+                                if chunk_count == 1:
+                                    first_chunk_time = _time.time() - start_time
+                                    logger.info(f"⚡ First chunk at +{first_chunk_time:.3f}s (TTFB)")
+                                
+                                # Strip markdown and pass through
+                                delta['content'] = strip_markdown(content)
+                                data['choices'][0]['delta'] = delta
+                            
+                            yield f"data: {json.dumps(data)}\n\n"
+                    
+                    except json.JSONDecodeError:
+                        continue
+                
+                logger.info(f"✅ Stream complete: {chunk_count} chunks in {_time.time() - start_time:.2f}s")
 
     if stream:
         return StreamingResponse(
@@ -149,17 +725,23 @@ async def proxy_chat_completions(request: Request):
             media_type="text/event-stream",
         )
     else:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        # Non-streaming path
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
-                f"{OPENCLAW_GATEWAY_URL}/v1/chat/completions",
-                json=body,
-                headers=headers,
+                XAI_API_URL,
+                json=grok_body,
+                headers=grok_headers,
             )
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                media_type="application/json",
-            )
+            
+            result = response.json()
+            
+            # Strip markdown from response content
+            if 'choices' in result and result['choices']:
+                content = result['choices'][0].get('message', {}).get('content', '')
+                result['choices'][0]['message']['content'] = strip_markdown(content)
+            
+            logger.info(f"✅ Non-stream complete in {_time.time() - start_time:.2f}s")
+            return result
 
 
 # ============================================================================
@@ -201,15 +783,27 @@ def get_agent_config(public_url: str) -> dict:
                 "endpoint": {
                     "url": llm_url,
                 },
-                "prompt": "You are a helpful voice assistant on a phone call. Keep responses concise and conversational (1-3 sentences). Never use markdown, bullet points, numbered lists, or emojis - your responses will be spoken aloud.",
+                "prompt": """You are Maya, Asim's AI assistant, speaking on a PHONE CALL.
+
+CRITICAL VOICE RULES:
+- You are SPEAKING, not typing. Talk naturally like a real conversation.
+- Never use asterisks, bullet points, numbered lists, or any markdown.
+- Never say "star star" or read formatting aloud.
+- Keep responses SHORT - 1 to 3 sentences max. This is a phone call.
+- Use contractions (I'm, you're, it's, don't, can't).
+- Use casual filler words naturally (like, well, so, okay, hmm).
+- If you need to do something that takes time, say "give me a sec" or "let me check".
+
+You have access to all your tools and can spawn sub-agents for longer tasks.
+When starting background work, tell the caller you're on it and stay available to chat.""",
             },
             "speak": {
                 "provider": {
                     "type": "deepgram",
-                    "model": "aura-2-thalia-en",
+                    "model": "aura-2-helena-en",
                 },
             },
-            "greeting": "Hello! How can I help you?",
+            "greeting": "Hey! What's up?",
         },
     }
 
@@ -390,6 +984,7 @@ async def twilio_media_websocket(websocket: WebSocket):
 # Telnyx Webhook & Media Stream
 # ============================================================================
 
+@app.post("/voice/webhook")
 @app.post("/telnyx/webhook")
 async def telnyx_webhook(request: Request):
     """Handle Telnyx webhook events - incoming calls and call control."""
@@ -399,17 +994,29 @@ async def telnyx_webhook(request: Request):
     logger.info(f"Telnyx webhook received: {event_type}")
     
     if event_type == "call.initiated":
-        # Incoming call - answer and start media streaming
-        call_control_id = body["data"]["payload"]["call_control_id"]
+        payload = body["data"]["payload"]
+        call_control_id = payload["call_control_id"]
+        caller = payload.get("from", "")
         
-        # Get the public URL from the request headers
+        if not is_allowed_caller(caller):
+            logger.warning(f"Rejecting unauthorized caller: {caller}")
+            headers = {"Authorization": f"Bearer {TELNYX_API_KEY}", "Content-Type": "application/json"}
+            try:
+                async with httpx.AsyncClient() as client:
+                    await client.post(f"https://api.telnyx.com/v2/calls/{call_control_id}/actions/hangup", headers=headers)
+            except Exception as e:
+                logger.error(f"Error hanging up: {e}")
+            return {"status": "rejected"}
+        
+        logger.info(f"Accepting call from: {caller}")
         host = request.headers.get("host", "localhost:8000")
         stream_url = f"wss://{host}/telnyx/media"
         
-        # Answer the call with media streaming
         answer_data = {
             "stream_url": stream_url,
-            "stream_track": "both_tracks"
+            "stream_track": "inbound_track",
+            "stream_bidirectional_mode": "rtp",
+            "stream_bidirectional_codec": "PCMU"
         }
         
         headers = {
@@ -501,12 +1108,26 @@ async def telnyx_media_websocket(websocket: WebSocket):
                         # Clear any queued audio (barge-in)
                         if call_control_id:
                             await websocket.send_json({"event": "clear"})
+                            # Also cancel any pending filler
+                            on_agent_started_speaking(call_control_id)
+                    elif event_type == "UserStoppedSpeaking":
+                        logger.info("[Silence] User stopped speaking - starting filler timer")
+                        # Start silence detection timer
+                        if call_control_id:
+                            on_user_stopped_speaking(call_control_id)
                     elif event_type == "AgentStartedSpeaking":
-                        logger.debug("Agent started speaking")
+                        logger.info("[Silence] Agent started speaking - cancelling filler")
+                        # Cancel filler timer - agent is responding
+                        if call_control_id:
+                            on_agent_started_speaking(call_control_id)
+                    elif event_type == "AgentAudioDone":
+                        logger.info("[Silence] Agent finished speaking")
                     elif event_type == "ConversationText":
                         role = event.get("role", "")
                         content = event.get("content", "")
                         logger.info(f"{role.capitalize()}: {content}")
+                    elif event_type == "InjectionRefused":
+                        logger.debug(f"Injection refused: {event.get('reason', 'unknown')}")
                     elif event_type == "Error":
                         logger.error(f"Deepgram error: {event}")
             
@@ -538,6 +1159,17 @@ async def telnyx_media_websocket(websocket: WebSocket):
                 start_data = message.get("start", {})
                 call_control_id = start_data.get("call_control_id")
                 stream_id = message.get("stream_id")
+                
+                # Store websockets for filler injection
+                if call_control_id:
+                    global last_active_call
+                    active_deepgram_sockets[call_control_id] = deepgram_ws
+                    active_telnyx_sockets[call_control_id] = {
+                        "ws": websocket,
+                        "stream_id": stream_id
+                    }
+                    last_active_call = call_control_id
+                    logger.info(f"Stored Deepgram socket for call: {call_control_id}")
                 
                 # Get the public URL from the websocket headers
                 host = websocket.headers.get("host", "localhost:8000")
@@ -594,6 +1226,15 @@ async def telnyx_media_websocket(websocket: WebSocket):
             receiver_task.cancel()
         if deepgram_ws:
             await deepgram_ws.close()
+        # Cleanup sockets from active dicts
+        for cid, ws in list(active_deepgram_sockets.items()):
+            if ws == deepgram_ws:
+                del active_deepgram_sockets[cid]
+                if cid in active_telnyx_sockets:
+                    del active_telnyx_sockets[cid]
+                cleanup_silence_state(cid)
+                logger.info(f"Removed socket for call: {cid}")
+                break
         logger.info("Telnyx cleanup complete")
 
 

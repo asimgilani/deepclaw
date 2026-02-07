@@ -37,3 +37,4 @@ docs/launch-content.md
 
 # Playwright
 .playwright-mcp/
+.worktrees/
